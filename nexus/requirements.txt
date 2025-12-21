@@ -1,0 +1,11 @@
+langgraph
+langchain
+langchain-groq
+langchain-google-genai
+mcp
+yfinance
+pandas
+pandas_ta
+duckduckgo-search
+streamlit
+python-dotenv
