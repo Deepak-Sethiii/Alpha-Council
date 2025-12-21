@@ -1,23 +1,17 @@
 from mcp.server.fastmcp import FastMCP
+from nexus.servers.tools import get_technical_summary
 
 # Initialize the Server
 mcp = FastMCP("Nexus Finance")
 
 @mcp.tool()
-def get_stock_price(ticker: str) -> dict:
+def analyze_stock(ticker: str) -> dict:
     """
-    Returns the current stock price. 
-    CURRENTLY A STUB: Returns fake data for testing.
+    Returns deterministic technical indicators (RSI, SMA) for a stock.
+    Currently uses the Deterministic Engine v1.
     """
-    # This print helps you see when Teammate A's agent calls your tool
-    print(f"DEBUG: Tool called for {ticker}")
-    
-    return {
-        "ticker": ticker,
-        "price": 150.00, 
-        "currency": "USD",
-        "status": "STUB_DATA - REAL LOGIC COMING SOON"
-    }
+    # Call the registry-based tool you just verified
+    return get_technical_summary(ticker)
 
 if __name__ == "__main__":
     mcp.run()
