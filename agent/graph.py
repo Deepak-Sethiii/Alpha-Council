@@ -1,11 +1,11 @@
 # agents/graph.py
 
 from langgraph.graph import StateGraph, END
-from agents.state import AgentState
+from agent.state import AgentState
 
 # Import the nodes (The brains Teammate B built/stubbed)
 # If this line errors, it means Teammate B hasn't named their functions exactly like this!
-from agents.nodes import (
+from agent.nodes import (
     technical_analyst, 
     fundamental_analyst, 
     risk_manager, 
