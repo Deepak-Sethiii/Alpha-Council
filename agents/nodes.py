@@ -1,126 +1,170 @@
+# agents/nodes.py
 import json
-import sys
 import os
+import sys
+import subprocess
 from langchain_groq import ChatGroq
 from langchain_core.messages import SystemMessage, HumanMessage
-from mcp import ClientSession, StdioServerParameters
-from mcp.client.stdio import stdio_client
-
-# Import your Prompts
+from agents.state import AgentState
 from agents.prompts import (
-    TECHNICAL_INITIAL_PROMPT,
-    FUNDAMENTAL_INITIAL_PROMPT,
-    RISK_CRITIQUE_PROMPT
+    TECHNICAL_INITIAL_PROMPT, TECHNICAL_REBUTTAL_PROMPT,
+    FUNDAMENTAL_INITIAL_PROMPT, FUNDAMENTAL_REBUTTAL_PROMPT,
+    RISK_CRITIQUE_PROMPT, get_current_date
 )
-from agents.utils import get_current_date
 
-# --- CONFIGURATION ---
-# Make sure GROQ_API_KEY is in your .env file!
-# agents/nodes.py
-
+# --- 1. SETUP LLM (Groq Only) ---
 def get_llm():
-    # UPDATED MODEL NAME below:
+    # Ensure GROQ_API_KEY is in your .env file
+    # You can change the model name if needed (e.g., "llama3-70b-8192")
     return ChatGroq(model_name="llama-3.3-70b-versatile", temperature=0.1)
 
-# --- MCP SERVER CONNECTION ---
-# We need to pass the current environment variables + PYTHONPATH
-# so the server knows where to find 'nexus.indicators'
-env_vars = os.environ.copy()
-env_vars["PYTHONPATH"] = os.getcwd()  # This adds D:\alpha-council\Alpha-Council to the path
-
-server_params = StdioServerParameters(
-    command=sys.executable, 
-    args=["nexus/servers/finance_server.py"], 
-    env=env_vars  # <--- CRITICAL CHANGE HERE
-)
-
-async def call_mcp_tool(tool_name: str, arguments: dict):
-    """Manually calls the MCP server to get data."""
-    async with stdio_client(server_params) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(tool_name, arguments)
-            # FastMCP returns a list of content, we grab the text
-            if result.content and len(result.content) > 0:
-                return result.content[0].text
-            return "No data returned."
-
-# --- THE AGENT WORKERS ---
-
-async def technical_analyst_node(state):
-    """The Technical Analyst Worker"""
-    ticker = state["ticker"]
-    print(f"\n📈 [Technical Agent] Starting analysis for {ticker}...")
+# --- 2. THE BRIDGE (Synchronous MCP Tool Call) ---
+def call_mcp_tool(tool_name, arguments):
+    """
+    Manually calls the finance_server.py script to get data.
+    """
+    # Point to the server file relative to the root
+    server_path = os.path.join("nexus", "servers", "finance_server.py")
+    cmd = [sys.executable, server_path]
     
-    # 1. Get Data from MCP
-    try:
-        raw_data = await call_mcp_tool("analyze_stock", {"ticker": ticker})
-    except Exception as e:
-        raw_data = f"Error fetching technical data: {e}"
+    # JSON-RPC Request
+    request = {
+        "jsonrpc": "2.0", 
+        "id": 1, 
+        "method": "tools/call", 
+        "params": {"name": tool_name, "arguments": arguments}
+    }
+    
+    # Setup Env
+    env = os.environ.copy()
+    env["PYTHONPATH"] = os.getcwd()
+    env["PYTHONIOENCODING"] = "utf-8"
 
-    # 2. Ask LLM
+    try:
+        # Run subprocess
+        process = subprocess.Popen(
+            cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env, encoding='utf-8'
+        )
+        stdout, stderr = process.communicate(input=json.dumps(request) + "\n")
+        
+        if stdout:
+            response = json.loads(stdout)
+            if "result" in response:
+                return response["result"]["content"][0]["text"]
+            else:
+                return f"MCP Error: {response}"
+        else:
+            return f"Connection Error: {stderr}"
+    except Exception as e:
+        return f"Execution Failed: {str(e)}"
+
+# --- 3. THE AGENT NODES (Matched to graph.py) ---
+
+def technical_analyst(state: AgentState):
+    ticker = state["ticker"]
+    print(f"\n📈 [Technical] Analyzing {ticker}...")
+    
+    # 1. Get Data
+    data = call_mcp_tool("analyze_stock", {"ticker": ticker})
+    
+    # 2. Think
     llm = get_llm()
-    # We format the prompt with the ticker
-    system_msg = TECHNICAL_INITIAL_PROMPT.format(ticker=ticker)
-    user_msg = f"Here is the live technical data from the tool:\n{raw_data}"
+    prompt = TECHNICAL_INITIAL_PROMPT.format(current_date=get_current_date(), ticker=ticker)
+    messages = [SystemMessage(content=prompt), HumanMessage(content=f"Data: {data}")]
+    response = llm.invoke(messages)
     
-    response = await llm.ainvoke([
-        SystemMessage(content=system_msg),
-        HumanMessage(content=user_msg)
-    ])
-    
-    # 3. Return Result (Parsing logic can be added here or in the graph)
-    return {"tech_report": response.content}
-
-async def fundamental_analyst_node(state):
-    """The Fundamental Analyst Worker"""
-    ticker = state["ticker"]
-    print(f"\n💰 [Fundamental Agent] Starting analysis for {ticker}...")
-    
-    # 1. Get Data from MCP
+    # 3. Parse JSON
     try:
-        raw_data = await call_mcp_tool("get_fundamentals", {"ticker": ticker})
-    except Exception as e:
-        raw_data = f"Error fetching fundamental data: {e}"
+        content = response.content.replace("```json", "").replace("```", "").strip()
+        result = json.loads(content)
+    except:
+        result = {"thesis": response.content, "confidence": 50}
 
-    # 2. Ask LLM
-    llm = get_llm()
-    system_msg = FUNDAMENTAL_INITIAL_PROMPT.format(ticker=ticker)
-    user_msg = f"Here is the live fundamental data from the tool:\n{raw_data}"
+    return {
+        "tech_thesis_initial": result.get("thesis"),
+        "tech_confidence_initial": result.get("confidence", 50)
+    }
 
-    response = await llm.ainvoke([
-        SystemMessage(content=system_msg),
-        HumanMessage(content=user_msg)
-    ])
-    
-    return {"fund_report": response.content}
-
-async def risk_analyst_node(state):
-    """The Risk Analyst Worker"""
+def fundamental_analyst(state: AgentState):
     ticker = state["ticker"]
-    # We grab the outputs from the previous agents if they exist
-    tech_thesis = state.get("tech_report", "Pending...")
-    fund_thesis = state.get("fund_report", "Pending...")
+    print(f"💰 [Fundamental] Analyzing {ticker}...")
     
-    print(f"\n🚨 [Risk Agent] Looking for trouble for {ticker}...")
-    
-    # 1. Search for bad news via MCP
-    try:
-        query = f"{ticker} negative news lawsuit fraud earnings miss"
-        news_data = await call_mcp_tool("search_news", {"query": query})
-    except Exception as e:
-        news_data = "No news found or error searching."
-
-    # 2. Formulate Critique using the helper from prompts.py
-    from agents.prompts import render_risk_critique_prompt
-    
-    # Render the prompt dynamically
-    prompt = render_risk_critique_prompt(ticker, tech_thesis, fund_thesis)
+    data = call_mcp_tool("get_fundamentals", {"ticker": ticker})
     
     llm = get_llm()
-    response = await llm.ainvoke([
+    prompt = FUNDAMENTAL_INITIAL_PROMPT.format(current_date=get_current_date(), ticker=ticker)
+    messages = [SystemMessage(content=prompt), HumanMessage(content=f"Data: {data}")]
+    response = llm.invoke(messages)
+    
+    try:
+        content = response.content.replace("```json", "").replace("```", "").strip()
+        result = json.loads(content)
+    except:
+        result = {"thesis": response.content, "confidence": 50}
+
+    return {
+        "fund_thesis_initial": result.get("thesis"),
+        "fund_confidence_initial": result.get("confidence", 50)
+    }
+
+def risk_manager(state: AgentState):
+    ticker = state["ticker"]
+    print(f"🚨 [Risk] Critiquing {ticker}...")
+    
+    news = call_mcp_tool("search_news", {"query": ticker})
+    
+    llm = get_llm()
+    prompt = RISK_CRITIQUE_PROMPT.format(
+        current_date=get_current_date(), 
+        tech_thesis=state["tech_thesis_initial"],
+        fund_thesis=state["fund_thesis_initial"],
+        ticker=ticker
+    )
+    messages = [SystemMessage(content=prompt), HumanMessage(content=f"News: {news}")]
+    response = llm.invoke(messages)
+    
+    try:
+        content = response.content.replace("```json", "").replace("```", "").strip()
+        result = json.loads(content)
+    except:
+        result = {"risk_critique_tech": "None", "risk_critique_fund": "None", "risk_score": 50}
+
+    return {
+        "risk_critique_tech": result.get("risk_critique_tech"),
+        "risk_critique_fund": result.get("risk_critique_fund"),
+        "risk_danger_score": result.get("risk_score", 50)
+    }
+
+def technical_rebuttal(state: AgentState):
+    print("📈 [Technical] Rebutting...")
+    llm = get_llm()
+    prompt = TECHNICAL_REBUTTAL_PROMPT.format(risk_critique=state["risk_critique_tech"])
+    messages = [
         SystemMessage(content=prompt),
-        HumanMessage(content=f"Here are the search results for negative news:\n{news_data}")
-    ])
-    
-    return {"risk_report": response.content}
+        HumanMessage(content=f"Original: {state['tech_thesis_initial']}")
+    ]
+    response = llm.invoke(messages)
+    return {
+        "tech_thesis_final": response.content,
+        "tech_confidence_final": state["tech_confidence_initial"]
+    }
+
+def fundamental_rebuttal(state: AgentState):
+    print("💰 [Fundamental] Rebutting...")
+    llm = get_llm()
+    prompt = FUNDAMENTAL_REBUTTAL_PROMPT.format(risk_critique=state["risk_critique_fund"])
+    messages = [
+        SystemMessage(content=prompt),
+        HumanMessage(content=f"Original: {state['fund_thesis_initial']}")
+    ]
+    response = llm.invoke(messages)
+    return {
+        "fund_thesis_final": response.content,
+        "fund_confidence_final": state["fund_confidence_initial"]
+    }
+
+def final_node(state: AgentState):
+    # Calls your Math Engine
+    from agents.final_verdict import calculate_verdict
+    return calculate_verdict(state)
