@@ -1,8 +1,10 @@
 import yfinance as yf
 from duckduckgo_search import DDGS
 from mcp.server.fastmcp import FastMCP
+from datetime import datetime
 import logging
 import os
+import re
 
 # 1. Silence all background noise
 logging.getLogger('yfinance').setLevel(logging.CRITICAL)
@@ -54,28 +56,45 @@ def get_fundamentals(ticker: str) -> str:
 import time
 import random
 
+from datetime import datetime
+
 @mcp.tool()
 def search_news(query: str) -> str:
+    """Production-grade news search with dynamic temporal gating."""
     try:
-        # 1. Add a tiny random sleep to dodge bot detection (0.5 to 1.5 seconds)
-        time.sleep(random.uniform(0.5, 1.5))
-        
-        # 2. Use a more specific query to force fresh results
-        fresh_query = f"{query} stock news Jan 2026" 
+        now = datetime.now()
+        # 🔒 Hard Constraint: Always include the current year/month in the query
+        current_context = now.strftime("%B %Y") 
+        dynamic_query = f"{query} {current_context}"
         
         with DDGS() as ddgs:
-            # max_results=5 gives the LLM more 'meat' to work with
-            results = list(ddgs.text(fresh_query, max_results=5))
+            # timelimit="m" forces DuckDuckGo to only return results from the last 30 days
+            results = list(ddgs.text(
+                dynamic_query, 
+                timelimit="m",  
+                max_results=8
+            ))
             
-        if not results:
-            return "No recent news found. Market may be quiet or search blocked."
-        
-        return "\n".join([f"- {r['title']} ({r['href']})" for r in results])
+        if not results: return "No news found for the current period."
+
+        # Dynamic valid window: current year and last year (for Q4 transition)
+        valid_years = {str(now.year), str(now.year - 1)}
+        cleaned_results = []
+
+        for r in results:
+            content = (r['title'] + r.get('body', '')).lower()
+            # Regex to find any 4-digit numbers starting with '20'
+            found_years = set(re.findall(r'\b(20\d{2})\b', content))
+            
+            # 🛡️ DETERMINISTIC FILTER: If it only mentions old years, it's a ghost result
+            if found_years and not (found_years & valid_years):
+                continue
+                
+            cleaned_results.append(f"- {r['title']} ({r['href']})")
+
+        return "\n".join(cleaned_results)
     except Exception as e:
-        # If DDG blocks us, let's at least know why
-        if "202" in str(e) or "Ratelimit" in str(e):
-            return "ERROR: News search is currently rate-limited by DuckDuckGo."
-        return f"News Tool Error: {str(e)}"
+        return f"Tool Error: {str(e)}"
 
 if __name__ == "__main__":
     mcp.run()
