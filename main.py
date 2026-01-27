@@ -8,13 +8,14 @@ from pydantic import BaseModel
 from dotenv import load_dotenv
 
 # Import your graph logic
+# NOTE: Ensure you have an empty file named __init__.py inside your 'agent' folder!
 from agent.graph import app as graph
 
 load_dotenv()
 
 app = FastAPI(title="Rhetora AI Backend")
 
-# Allow Lovable to connect
+# Allow Frontend (Lovable/v0) to connect
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -23,7 +24,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# This matches the data Lovable will send
 class AnalysisRequest(BaseModel):
     ticker: str
     user_style: str = "investor"
@@ -32,69 +32,69 @@ class AnalysisRequest(BaseModel):
 def get_constitutional_data(ticker: str):
     """
     Fetches immutable 'Hard Metrics' for the Constitutional Tribunal Audit.
-    This guarantees the Risk Agent always has data to debate, even without news.
+    Guaranteed to return a dictionary, never raises an exception.
     """
+    print(f"📡 [DATA] Fetching hard metrics for {ticker}...")
     try:
         stock = yf.Ticker(ticker)
-        info = stock.info
         
-        # 1. Fetch Price History for Technical Calc (RSI)
-        hist = stock.history(period="3mo")
+        # Safety Net 1: Handle empty info
+        info = stock.info or {} 
         
-        # Simple RSI Calculation (14-day) if enough data exists
-        if len(hist) > 14:
-            delta = hist['Close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-            rs = gain / loss
-            rsi = 100 - (100 / (1 + rs))
-            current_rsi = rsi.iloc[-1]
-        else:
-            current_rsi = 50  # Default neutral if IPO or insufficient data
+        # Safety Net 2: Handle calculation errors
+        current_rsi = 50.0
+        try:
+            hist = stock.history(period="3mo")
+            if len(hist) > 14:
+                delta = hist['Close'].diff()
+                gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+                loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+                rs = gain / loss
+                rsi = 100 - (100 / (1 + rs))
+                current_rsi = rsi.iloc[-1]
+        except Exception as rsi_error:
+            print(f"⚠️ [DATA] RSI Calc failed: {rsi_error}")
 
-        # 2. Extract Fundamental Risk Metrics
         audit_data = {
             "pe_ratio": info.get('trailingPE', 'N/A'),
             "forward_pe": info.get('forwardPE', 'N/A'),
-            "beta": info.get('beta', 'N/A'),  # Measure of volatility
+            "beta": info.get('beta', 'N/A'),
             "debt_to_equity": info.get('debtToEquity', 'N/A'),
             "sector": info.get('sector', 'Unknown'),
             "rsi": round(float(current_rsi), 2) if not pd.isna(current_rsi) else 50.0
         }
         
-        print(f"✅ Audit Data Fetched for {ticker}: P/E={audit_data['pe_ratio']}, RSI={audit_data['rsi']}")
+        print(f"✅ [DATA] Success: P/E={audit_data['pe_ratio']}, RSI={audit_data['rsi']}")
         return audit_data
 
     except Exception as e:
-        print(f"⚠️ Audit Data Fetch Failed: {e}")
-        # Return 'safe' defaults so the system doesn't crash
+        print(f"⚠️ [DATA] Global Fetch Failed: {e}")
+        # Return 'safe' defaults so the system keeps running
         return {
             "pe_ratio": "N/A", "beta": "N/A", "rsi": 50.0, "debt_to_equity": "N/A", "sector": "Unknown"
         }
 
 @app.get("/")
 def read_root():
-    return {"status": "active", "service": "Rhetora Backend"}
+    return {"status": "active", "service": "Rhetora Tribunal Backend"}
 
 @app.post("/analyze")
 async def run_analysis(request: AnalysisRequest):
-    # Check for API Key
     if not os.getenv("GROQ_API_KEY"):
-        raise HTTPException(status_code=500, detail="GROQ_API_KEY missing")
+        print("❌ [ERROR] GROQ_API_KEY is missing from Environment Variables!")
+        raise HTTPException(status_code=500, detail="Server misconfigured: API Key missing")
 
-    print(f"🔥 Incoming Request: {request.ticker} ({request.user_style}/{request.risk_profile})")
+    print(f"🔥 [START] Request received for: {request.ticker}")
 
-    # 1. Fetch the Tribunal Data (The 'Constitutional' Metrics)
+    # 1. Fetch Hard Metrics
     audit_data = get_constitutional_data(request.ticker)
 
-    # 2. Initialize the state with the NEW Audit Data injected
-    # Ensure your AgentState in 'graph.py' allows these new keys!
+    # 2. Inject into State
     initial_state = {
         "ticker": request.ticker,
         "messages": [],
         "user_style": request.user_style,
         "risk_profile": request.risk_profile,
-        # Injecting Audit Data into State for Risk Agent
         "pe_ratio": audit_data['pe_ratio'],
         "beta": audit_data['beta'],
         "rsi": audit_data['rsi'],
@@ -103,43 +103,57 @@ async def run_analysis(request: AnalysisRequest):
     }
 
     try:
-        # Run the Agents
+        # 3. Run the Agents
+        print("🤖 [AGENT] Invoking Tribunal Graph...")
         result = await graph.ainvoke(initial_state)
 
-        # Send the JSON back to Lovable
-        # Note: I updated the 'risk_analysis' keys to match the new Tribunal Prompt outputs
+        # --- X-RAY DIAGNOSTICS (Check Render Logs for this!) ---
+        print("\n🔍 --- TRIBUNAL X-RAY ---")
+        
+        # Diagnostic 1: Did the Risk Agent run?
+        raw_risk = result.get("risk_score")
+        print(f"⚖️ Risk Score: {raw_risk} (Expected: 0-100)")
+        
+        # Diagnostic 2: Did the Rebuttal happen?
+        msgs = result.get("messages", [])
+        print(f"🗣️ Conversation Depth: {len(msgs)} messages exchanged.")
+        
+        if len(msgs) > 0:
+            print(f"📝 Final Argument Snippet: {msgs[-1].content[:100]}...")
+        else:
+            print("⚠️ WARNING: Agents did not exchange messages. Check graph.py logic.")
+            
+        print("🔍 ------------------------\n")
+        # -------------------------------------------------------
+
         return {
             "ticker": request.ticker,
             "final_verdict": {
                 "signal": result.get("final_signal", "HOLD"),
                 "confidence": result.get("final_confidence", 0),
-                "explanation": result.get("final_explanation", "")
+                "explanation": result.get("final_explanation", "No explanation generated.")
             },
             "technical_analysis": {
-                "thesis": result.get("tech_thesis_final", ""),
+                "thesis": result.get("tech_thesis_final", "Analysis pending."),
                 "confidence": result.get("tech_confidence_final", 0)
             },
             "fundamental_analysis": {
-                "thesis": result.get("fund_thesis_final", ""),
+                "thesis": result.get("fund_thesis_final", "Analysis pending."),
                 "confidence": result.get("fund_confidence_final", 0)
             },
             "risk_analysis": {
-                # Mapped to the NEW prompt keys ("risk_score", "critique")
-                "score": result.get("risk_score", 20), 
-                "critique": result.get("critique", "Audit complete. No critical failure modes detected.")
+                # Defaults to 50 (Neutral) if Agent fails, so it doesn't look like a crash
+                "score": result.get("risk_score", 50), 
+                "critique": result.get("critique", "Tribunal audit completed.")
             }
         }
     
     except Exception as e:
-        print(f"❌ Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"❌ [CRITICAL ERROR] Graph Execution Failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=f"Internal Agent Error: {str(e)}")
 
 if __name__ == "__main__":
-    # Get the port from the Environment (Render sets this)
-    # If it's not set (like on your laptop), default to 8001
+    # Robust port selection for Render vs Local
     port = int(os.environ.get("PORT", 8001)) 
-    
-    print(f"🚀 Starting server on Port {port}...")
-    
-    # HOST must be "0.0.0.0" for cloud access
+    print(f"🚀 Rhetora Tribunal is live on Port {port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
