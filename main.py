@@ -142,9 +142,11 @@ async def run_analysis(request: AnalysisRequest):
                 "confidence": result.get("fund_confidence_final", 0)
             },
             "risk_analysis": {
-                # Defaults to 50 (Neutral) if Agent fails, so it doesn't look like a crash
-                "score": result.get("risk_score", 50), 
-                "critique": result.get("critique", "Tribunal audit completed.")
+                # 1. Change 'risk_score' to 'risk_danger_score' to match AgentState
+                "score": result.get("risk_danger_score", 50), 
+                
+                # 2. Change 'critique' to 'risk_critique_tech' to match prompts.py output
+                "critique": result.get("risk_critique_tech", "Tribunal audit completed.")
             }
         }
     
